@@ -7,10 +7,12 @@ import cloudscraper
 import requests.cookies
 import zipfile
 import rarfile
-import threading
-import itertools
 import inquirer
+import img2pdf
+import shutil
+import tempfile
 from pathlib import Path
+from PIL import Image
 from bs4 import BeautifulSoup
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service as ChromeService
@@ -34,7 +36,13 @@ ENDC = '\033[0m'
 SEPARATOR = f"\n{GREY}────────────────────────────────────────────────────────────{ENDC}"
 
 def clear_console():
-    os.system('cls' if os.name == 'nt' else 'clear')
+    # Use ANSI escape codes for better compatibility with inquirer
+    # \033[2J - Clear entire screen
+    # \033[H - Move cursor to home position (top-left)
+    if os.name == 'nt':
+        os.system('cls')
+    else:
+        print('\033[2J\033[H', end='', flush=True)
 
 def print_menu():
     title = f"{MAGENTA_BG}{BLACK_FG}{BOLD} COM-X.LIFE Downloader{ENDC}"
@@ -115,7 +123,7 @@ class ComXLifeDownloader:
                             return False
                     time.sleep(1)
                 except Exception:
-                    print(f"\n✗ Браузер был закрыт пользователем до завершения авторизации.")
+                    print("\n✗ Браузер был закрыт пользователем до завершения авторизации.")
                     return False
         except Exception as e:
             print(f"✗ Ошибка во время ожидания авторизации: {e}")
@@ -123,7 +131,7 @@ class ComXLifeDownloader:
         finally:
             try:
                 driver.quit()
-            except:
+            except Exception:
                 pass
         return False
 
@@ -144,9 +152,9 @@ class ComXLifeDownloader:
                     for name, value in self.cookies.items():
                         new_jar.set(name, value, domain='com-x.life')
                     self.session.cookies = new_jar
-                print(f"✓ Cookies загружены из файла")
+                print("✓ Cookies загружены из файла")
                 return True
-            except:
+            except Exception:
                 pass
         return False
 
@@ -161,13 +169,16 @@ class ComXLifeDownloader:
             encoded_query = quote(query)
             search_url = f"{self.base_url}/search/{encoded_query}/page/{page}/" if page > 1 else f"{self.base_url}/search/{encoded_query}"
             response = self.session.get(search_url, headers=self.headers)
-            if response.status_code != 200: return []
+            if response.status_code != 200:
+                return []
             soup = BeautifulSoup(response.content, 'lxml')
             content = soup.find('div', id='dle-content')
-            if not content: return []
+            if not content:
+                return []
             results = []
             title_tags = content.find_all('h3', class_='readed__title')
-            if not title_tags: return []
+            if not title_tags:
+                return []
             for title_tag in title_tags:
                 if title_tag.a:
                     title = title_tag.a.text.strip()
@@ -292,24 +303,25 @@ class ComXLifeDownloader:
 
             download_url = "https:" + raw_url.replace("\\/", "/")
 
-            if self.debug:
-                print(f"  [DEBUG] API response: {json_data}")
-                print(f"  [DEBUG] Download URL: {download_url}")
+            # if self.debug:
+            #     print(f"  [DEBUG] API response: {json_data}")
+            #     print(f"  [DEBUG] Download URL: {download_url}")
 
             parsed_url = urlparse(download_url)
             ext = Path(parsed_url.path).suffix
-            if ext not in ['.zip', '.cbr']: ext = '.cbr'
+            if ext not in ['.zip', '.cbr']:
+                ext = '.cbr'
             temp_archive_path = chapter_folder / f"__archive__{ext}"
 
             download_headers = self.headers.copy()
             download_headers['Referer'] = manga_url
             archive_response = self.session.get(download_url, headers=download_headers, stream=True, timeout=60)
 
-            if self.debug:
-                print(f"  [DEBUG] Request headers: {dict(archive_response.request.headers)}")
-                print(f"  [DEBUG] Response status: {archive_response.status_code}")
-                print(f"  [DEBUG] Response headers: {dict(archive_response.headers)}")
-                print(f"  [DEBUG] Session cookies: {dict(self.session.cookies)}")
+            # if self.debug:
+            #     print(f"  [DEBUG] Request headers: {dict(archive_response.request.headers)}")
+            #     print(f"  [DEBUG] Response status: {archive_response.status_code}")
+            #     print(f"  [DEBUG] Response headers: {dict(archive_response.headers)}")
+            #     print(f"  [DEBUG] Session cookies: {dict(self.session.cookies)}")
 
             if archive_response.status_code == 200:
                 with open(temp_archive_path, 'wb') as f:
@@ -344,7 +356,7 @@ class ComXLifeDownloader:
                     if temp_archive_path.exists():
                         try:
                             temp_archive_path.unlink()
-                        except:
+                        except Exception:
                             pass
 
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
@@ -371,7 +383,7 @@ class ComXLifeDownloader:
             if temp_archive_path and temp_archive_path.exists():
                 try:
                     temp_archive_path.unlink()
-                except:
+                except Exception:
                     pass
             return False
 
@@ -434,6 +446,10 @@ class ComXLifeDownloader:
         print(f"✓ Успешно скачано: {success_count}/{len(chapters)} глав")
         print(f"🕒 Общее время: {total_time_taken:.2f} сек")
         print(f"📁 Сохранено в: {base_manga_folder.absolute()}\n")
+
+        if success_count > 0:
+            self.prompt_pdf_creation(base_manga_folder, manga_title)
+
         return True
 
     @staticmethod
@@ -466,6 +482,204 @@ class ComXLifeDownloader:
                 return num, num
             except ValueError:
                 return None, None
+
+    @staticmethod
+    def parse_chapter_sort_key(folder_name):
+        """Extract volume/chapter numbers from folder name for sorting."""
+        # Pattern: "Vol. X Ch. Y - Title"
+        match = re.match(r'Vol\.\s*([\d.]+)\s*Ch\.\s*([\d.]+)', folder_name)
+        if match:
+            try:
+                vol = float(match.group(1))
+                ch = float(match.group(2))
+                return (vol, ch)
+            except ValueError:
+                pass
+
+        # Pattern: "Ch. X - Title"
+        match = re.match(r'Ch\.\s*([\d.]+)', folder_name)
+        if match:
+            try:
+                ch = float(match.group(1))
+                return (0, ch)
+            except ValueError:
+                pass
+
+        # Fallback: extract any number
+        numbers = re.findall(r'[\d.]+', folder_name)
+        if numbers:
+            try:
+                return (0, float(numbers[0]))
+            except ValueError:
+                pass
+
+        return (0, 0)
+
+    @staticmethod
+    def get_sorted_chapter_folders(manga_folder):
+        """Return chapter folders sorted by volume/chapter number."""
+        folders = [f for f in manga_folder.iterdir() if f.is_dir()]
+        folders.sort(key=lambda f: ComXLifeDownloader.parse_chapter_sort_key(f.name))
+        return folders
+
+    @staticmethod
+    def get_sorted_images(chapter_folder):
+        """Return image files sorted naturally (2.jpg before 10.jpg)."""
+        image_extensions = {'.jpg', '.jpeg', '.png', '.webp'}
+        images = [f for f in chapter_folder.iterdir()
+                  if f.is_file() and f.suffix.lower() in image_extensions]
+
+        def natural_sort_key(path):
+            # Extract numbers for natural sorting
+            parts = re.split(r'(\d+)', path.stem)
+            return [int(p) if p.isdigit() else p.lower() for p in parts]
+
+        images.sort(key=natural_sort_key)
+        return images
+
+    @staticmethod
+    def convert_webp_to_jpeg(webp_path, temp_dir):
+        """Convert WebP image to JPEG for img2pdf compatibility."""
+        try:
+            img = Image.open(webp_path)
+            # Handle RGBA/alpha channel
+            if img.mode in ('RGBA', 'LA', 'P'):
+                # Create white background
+                background = Image.new('RGB', img.size, (255, 255, 255))
+                if img.mode == 'P':
+                    img = img.convert('RGBA')
+                background.paste(img, mask=img.split()[-1] if img.mode == 'RGBA' else None)
+                img = background
+            elif img.mode != 'RGB':
+                img = img.convert('RGB')
+
+            jpeg_path = Path(temp_dir) / f"{webp_path.stem}.jpg"
+            img.save(jpeg_path, 'JPEG', quality=95)
+            return jpeg_path
+        except Exception as e:
+            print(f"    {YELLOW}⚠ Не удалось конвертировать {webp_path.name}: {e}{ENDC}")
+            return None
+
+    def create_pdf(self, manga_folder, output_pdf_path):
+        """Create PDF from all chapter images."""
+        print(f"\n{CYAN}📄 Создание PDF...{ENDC}")
+
+        chapter_folders = self.get_sorted_chapter_folders(manga_folder)
+        if not chapter_folders:
+            print(f"{RED}✗ Не найдено папок с главами{ENDC}")
+            return False
+
+        all_images = []
+        temp_dir = None
+
+        try:
+            # Collect all images
+            for folder in chapter_folders:
+                images = self.get_sorted_images(folder)
+                if not images:
+                    print(f"  {YELLOW}⚠ Пустая папка: {folder.name}{ENDC}")
+                    continue
+                all_images.extend(images)
+
+            if not all_images:
+                print(f"{RED}✗ Не найдено изображений для PDF{ENDC}")
+                return False
+
+            print(f"  Найдено {len(all_images)} изображений в {len(chapter_folders)} главах")
+
+            # Process images (convert WebP if needed)
+            temp_dir = tempfile.mkdtemp()
+            image_paths = []
+
+            for idx, img_path in enumerate(all_images):
+                # Show progress
+                progress = (idx + 1) / len(all_images) * 100
+                print(f"\r  Обработка: {progress:.0f}%", end="", flush=True)
+
+                if img_path.suffix.lower() == '.webp':
+                    converted = self.convert_webp_to_jpeg(img_path, temp_dir)
+                    if converted:
+                        image_paths.append(str(converted))
+                else:
+                    image_paths.append(str(img_path))
+
+            print("\r  Обработка: 100%   ")
+
+            if not image_paths:
+                print(f"{RED}✗ Нет изображений для включения в PDF{ENDC}")
+                return False
+
+            # Create PDF
+            print("  Генерация PDF...")
+            with open(output_pdf_path, 'wb') as f:
+                f.write(img2pdf.convert(image_paths))
+
+            # Report file size
+            file_size = output_pdf_path.stat().st_size
+            if file_size >= 1024 * 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024 * 1024):.2f} ГБ"
+            elif file_size >= 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024):.2f} МБ"
+            else:
+                size_str = f"{file_size / 1024:.2f} КБ"
+
+            print(f"{GREEN}✓ PDF создан: {output_pdf_path} ({size_str}){ENDC}")
+            return True
+
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⚠ Создание PDF прервано{ENDC}")
+            if output_pdf_path.exists():
+                output_pdf_path.unlink()
+            return False
+        except Exception as e:
+            print(f"{RED}✗ Ошибка создания PDF: {e}{ENDC}")
+            return False
+        finally:
+            # Clean up temp directory
+            if temp_dir and os.path.exists(temp_dir):
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+    def delete_manga_folder(self, manga_folder):
+        """Delete the entire manga folder with all images."""
+        try:
+            shutil.rmtree(manga_folder)
+            print(f"✓ Удалена папка: {manga_folder.name}")
+        except Exception as e:
+            print(f"  {YELLOW}⚠ Не удалось удалить {manga_folder.name}: {e}{ENDC}")
+
+    def prompt_pdf_creation(self, manga_folder, manga_title):
+        """Ask user if they want to create PDF and optionally delete originals."""
+        try:
+            questions = [
+                inquirer.Confirm('create_pdf',
+                                 message="📄 Создать PDF из всех глав?",
+                                 default=True),
+            ]
+            answers = inquirer.prompt(questions)
+
+            if not answers or not answers['create_pdf']:
+                return
+
+            # Create PDF in parent directory (e.g., Manga/Title.pdf instead of Manga/Title/Title.pdf)
+            pdf_filename = f"{manga_title}.pdf"
+            output_pdf_path = manga_folder.parent / pdf_filename
+
+            if not self.create_pdf(manga_folder, output_pdf_path):
+                return
+
+            # Ask about deleting originals
+            questions = [
+                inquirer.Confirm('delete_originals',
+                                 message="🗑  Удалить исходные изображения?",
+                                 default=False),
+            ]
+            answers = inquirer.prompt(questions)
+
+            if answers and answers['delete_originals']:
+                self.delete_manga_folder(manga_folder)
+
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⚠ Отменено{ENDC}")
 
 def main():
     if sys.version_info < (3, 7):

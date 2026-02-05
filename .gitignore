@@ -1,0 +1,7 @@
+venv/
+Manga/
+.claude/
+claude.md
+comx_cookies.json
+__pycache__/
+.ruff_cache/
