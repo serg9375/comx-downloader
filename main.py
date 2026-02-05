@@ -3,7 +3,8 @@ import sys
 import time
 import json
 import re
-import requests
+import cloudscraper
+import requests.cookies
 import zipfile
 import rarfile
 import threading
@@ -41,9 +42,13 @@ def print_menu():
     print(f"\n{title}  {author}\n")
 
 class ComXLifeDownloader:
-    def __init__(self, browser_choice='chrome'):
+    def __init__(self, browser_choice='chrome', debug=False):
+        self.debug = debug
         self.base_url = "https://com-x.life"
-        self.session = requests.Session()
+        self.session = cloudscraper.create_scraper(
+            browser={'browser': 'chrome', 'platform': 'windows', 'mobile': False},
+            delay=1
+        )
         self.cookies = {}
         self.browser_choice = browser_choice
         self.headers = {
@@ -96,7 +101,11 @@ class ComXLifeDownloader:
                         cookies_list = driver.get_cookies()
                         for cookie in cookies_list:
                             self.cookies[cookie['name']] = cookie['value']
-                            self.session.cookies.set(cookie['name'], cookie['value'])
+                        # Create a new cookie jar to completely replace session cookies (avoids duplicates)
+                        new_jar = requests.cookies.RequestsCookieJar()
+                        for name, value in self.cookies.items():
+                            new_jar.set(name, value, domain='com-x.life')
+                        self.session.cookies = new_jar
                         if self.cookies:
                             self.save_cookies()
                             print(f"✓ Получено {len(self.cookies)} cookies\n")
@@ -130,8 +139,11 @@ class ComXLifeDownloader:
             try:
                 with open(cookies_file, 'r', encoding='utf-8') as f:
                     self.cookies = json.load(f)
+                    # Create a new cookie jar to completely replace session cookies (avoids duplicates)
+                    new_jar = requests.cookies.RequestsCookieJar()
                     for name, value in self.cookies.items():
-                        self.session.cookies.set(name, value)
+                        new_jar.set(name, value, domain='com-x.life')
+                    self.session.cookies = new_jar
                 print(f"✓ Cookies загружены из файла")
                 return True
             except:
@@ -241,7 +253,10 @@ class ComXLifeDownloader:
         # ========================================================================
         # === ИЗМЕНЕНИЕ (v5.9): Убран Spinner ===
         # ========================================================================
-        print(f"  🔗 Скачиваю: {chapter_title_safe}...", end="", flush=True)
+        if self.debug:
+            print(f"  🔗 Скачиваю: {chapter_title_safe}...")
+        else:
+            print(f"  🔗 Скачиваю: {chapter_title_safe}...", end="", flush=True)
 
         try:
             api_url = f"{self.base_url}/engine/ajax/controller.php?mod=api&action=chapters/download"
@@ -258,7 +273,10 @@ class ComXLifeDownloader:
 
             if link_resp.status_code != 200:
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                print(f"\r  ✗ Ошибка API: {link_resp.status_code} для [#{chapter_posi}] {time_taken_s}")
+                if self.debug:
+                    print(f"  ✗ Ошибка API: {link_resp.status_code} для [#{chapter_posi}] {time_taken_s}")
+                else:
+                    print(f"\r  ✗ Ошибка API: {link_resp.status_code} для [#{chapter_posi}] {time_taken_s}")
                 return False
 
             json_data = link_resp.json()
@@ -266,15 +284,32 @@ class ComXLifeDownloader:
 
             if not raw_url:
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                print(f"\r  ✗ API не вернул ссылку для [#{chapter_posi}] (error: {json_data.get('error')}) {time_taken_s}")
+                if self.debug:
+                    print(f"  ✗ API не вернул ссылку для [#{chapter_posi}] (error: {json_data.get('error')}) {time_taken_s}")
+                else:
+                    print(f"\r  ✗ API не вернул ссылку для [#{chapter_posi}] (error: {json_data.get('error')}) {time_taken_s}")
                 return False
 
             download_url = "https:" + raw_url.replace("\\/", "/")
+
+            if self.debug:
+                print(f"  [DEBUG] API response: {json_data}")
+                print(f"  [DEBUG] Download URL: {download_url}")
+
             parsed_url = urlparse(download_url)
             ext = Path(parsed_url.path).suffix
             if ext not in ['.zip', '.cbr']: ext = '.cbr'
             temp_archive_path = chapter_folder / f"__archive__{ext}"
-            archive_response = self.session.get(download_url, headers=self.headers, stream=True, timeout=60)
+
+            download_headers = self.headers.copy()
+            download_headers['Referer'] = manga_url
+            archive_response = self.session.get(download_url, headers=download_headers, stream=True, timeout=60)
+
+            if self.debug:
+                print(f"  [DEBUG] Request headers: {dict(archive_response.request.headers)}")
+                print(f"  [DEBUG] Response status: {archive_response.status_code}")
+                print(f"  [DEBUG] Response headers: {dict(archive_response.headers)}")
+                print(f"  [DEBUG] Session cookies: {dict(self.session.cookies)}")
 
             if archive_response.status_code == 200:
                 with open(temp_archive_path, 'wb') as f:
@@ -293,11 +328,17 @@ class ComXLifeDownloader:
                         extracted = True
                     except Exception:
                         time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                        print(f"\r  ✗ Ошибка распаковки: {chapter_title_safe} (не ZIP и не RAR) {time_taken_s}")
+                        if self.debug:
+                            print(f"  ✗ Ошибка распаковки: {chapter_title_safe} (не ZIP и не RAR) {time_taken_s}")
+                        else:
+                            print(f"\r  ✗ Ошибка распаковки: {chapter_title_safe} (не ZIP и не RAR) {time_taken_s}")
                         return False
                 except Exception:
                     time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                    print(f"\r  ✗ Ошибка распаковки (ZIP): {chapter_title_safe} {time_taken_s}")
+                    if self.debug:
+                        print(f"  ✗ Ошибка распаковки (ZIP): {chapter_title_safe} {time_taken_s}")
+                    else:
+                        print(f"\r  ✗ Ошибка распаковки (ZIP): {chapter_title_safe} {time_taken_s}")
                     return False
                 finally:
                     if temp_archive_path.exists():
@@ -308,16 +349,25 @@ class ComXLifeDownloader:
 
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
                 # Перезаписываем строку "Скачиваю..."
-                print(f"\r  ✓ {chapter_title_safe} {time_taken_s}{' ' * 20}")
+                if self.debug:
+                    print(f"  ✓ {chapter_title_safe} {time_taken_s}")
+                else:
+                    print(f"\r  ✓ {chapter_title_safe} {time_taken_s}{' ' * 20}")
                 return extracted
             else:
                 time_taken_s = f"({time.time() - start_time:.2f} сек)"
-                print(f"\r  ✗ Ошибка скачивания файла: {archive_response.status_code} {time_taken_s}")
+                if self.debug:
+                    print(f"  ✗ Ошибка скачивания файла: {archive_response.status_code} {time_taken_s}")
+                else:
+                    print(f"\r  ✗ Ошибка скачивания файла: {archive_response.status_code} {time_taken_s}")
                 return False
 
         except Exception as e:
             time_taken_s = f"({time.time() - start_time:.2f} сек)"
-            print(f"\r  ✗ Критическая ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
+            if self.debug:
+                print(f"  ✗ Критическая ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
+            else:
+                print(f"\r  ✗ Критическая ошибка: {chapter_title_safe} ({e}) {time_taken_s}")
             if temp_archive_path and temp_archive_path.exists():
                 try:
                     temp_archive_path.unlink()
@@ -437,7 +487,7 @@ def main():
             raise KeyboardInterrupt
 
         browser_name = answers['browser'].lower()
-        downloader = ComXLifeDownloader(browser_choice=browser_name)
+        downloader = ComXLifeDownloader(browser_choice=browser_name, debug=True)
 
         while True:
             clear_console()
