@@ -448,7 +448,7 @@ class ComXLifeDownloader:
         print(f"📁 Сохранено в: {base_manga_folder.absolute()}\n")
 
         if success_count > 0:
-            self.prompt_pdf_creation(base_manga_folder, manga_title)
+            self.prompt_output_creation(base_manga_folder, manga_title)
 
         return True
 
@@ -647,24 +647,89 @@ class ComXLifeDownloader:
         except Exception as e:
             print(f"  {YELLOW}⚠ Не удалось удалить {manga_folder.name}: {e}{ENDC}")
 
-    def prompt_pdf_creation(self, manga_folder, manga_title):
-        """Ask user if they want to create PDF and optionally delete originals."""
+    def create_cbz(self, manga_folder, output_cbz_path):
+        """Create CBZ (Comic Book ZIP) from all chapter images."""
+        print(f"\n{CYAN}📦 Создание CBZ...{ENDC}")
+
+        chapter_folders = self.get_sorted_chapter_folders(manga_folder)
+        if not chapter_folders:
+            print(f"{RED}✗ Не найдено папок с главами{ENDC}")
+            return False
+
+        try:
+            total_images = 0
+            for folder in chapter_folders:
+                total_images += len(self.get_sorted_images(folder))
+
+            if total_images == 0:
+                print(f"{RED}✗ Не найдено изображений для CBZ{ENDC}")
+                return False
+
+            print(f"  Найдено {total_images} изображений в {len(chapter_folders)} главах")
+
+            processed = 0
+            with zipfile.ZipFile(output_cbz_path, 'w', zipfile.ZIP_STORED) as zf:
+                for ch_idx, folder in enumerate(chapter_folders):
+                    chapter_num = f"{ch_idx + 1:03d}"
+                    images = self.get_sorted_images(folder)
+
+                    for img_idx, img_path in enumerate(images):
+                        processed += 1
+                        progress = processed / total_images * 100
+                        print(f"\r  Упаковка: {progress:.0f}%", end="", flush=True)
+
+                        arcname = f"{chapter_num}/{img_idx + 1:03d}{img_path.suffix.lower()}"
+                        zf.write(img_path, arcname)
+
+            print("\r  Упаковка: 100%   ")
+
+            # Report file size
+            file_size = output_cbz_path.stat().st_size
+            if file_size >= 1024 * 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024 * 1024):.2f} ГБ"
+            elif file_size >= 1024 * 1024:
+                size_str = f"{file_size / (1024 * 1024):.2f} МБ"
+            else:
+                size_str = f"{file_size / 1024:.2f} КБ"
+
+            print(f"{GREEN}✓ CBZ создан: {output_cbz_path} ({size_str}){ENDC}")
+            return True
+
+        except KeyboardInterrupt:
+            print(f"\n{YELLOW}⚠ Создание CBZ прервано{ENDC}")
+            if output_cbz_path.exists():
+                output_cbz_path.unlink()
+            return False
+        except Exception as e:
+            print(f"{RED}✗ Ошибка создания CBZ: {e}{ENDC}")
+            return False
+
+    def prompt_output_creation(self, manga_folder, manga_title):
+        """Ask user which output format to create and optionally delete originals."""
         try:
             questions = [
-                inquirer.Confirm('create_pdf',
-                                 message="📄 Создать PDF из всех глав?",
-                                 default=True),
+                inquirer.List('format',
+                              message="📦 Выберите формат для сохранения",
+                              choices=[
+                                  ('CBZ (рекомендуется)', 'cbz'),
+                                  ('PDF', 'pdf'),
+                                  ('Не создавать', 'skip'),
+                              ],
+                              carousel=True),
             ]
             answers = inquirer.prompt(questions)
 
-            if not answers or not answers['create_pdf']:
+            if not answers or answers['format'] == 'skip':
                 return
 
-            # Create PDF in parent directory (e.g., Manga/Title.pdf instead of Manga/Title/Title.pdf)
-            pdf_filename = f"{manga_title}.pdf"
-            output_pdf_path = manga_folder.parent / pdf_filename
+            output_path = manga_folder.parent / f"{manga_title}.{answers['format']}"
 
-            if not self.create_pdf(manga_folder, output_pdf_path):
+            if answers['format'] == 'cbz':
+                success = self.create_cbz(manga_folder, output_path)
+            else:
+                success = self.create_pdf(manga_folder, output_path)
+
+            if not success:
                 return
 
             # Ask about deleting originals
@@ -707,16 +772,10 @@ def main():
             clear_console()
             print_menu()
 
-            questions = [
-                inquirer.Text('query',
-                              message="📖 Введите URL или Название манги (Enter для выхода)"),
-            ]
-            answers = inquirer.prompt(questions)
+            input_str = input(f"{CYAN}📖 Введите URL или Название манги (Enter для выхода): {ENDC}").strip()
 
-            if not answers or not answers['query']:
+            if not input_str:
                 raise KeyboardInterrupt
-
-            input_str = answers['query'].strip()
             manga_url = None
 
             if 'com-x.life' in input_str and 'http' in input_str:
@@ -766,21 +825,9 @@ def main():
             if not manga_url:
                  continue
 
-            questions = [
-                inquirer.Text('output',
-                              message="📁 Папка для сохранения",
-                              default='Manga'),
-                inquirer.Text('range',
-                              message="💡 Укажите диапазон (Enter = все)",
-                              default=''),
-            ]
-            answers = inquirer.prompt(questions)
-
-            if not answers:
-                continue
-
-            output_dir = answers['output'].strip() or 'manga'
-            start_chapter, end_chapter = ComXLifeDownloader.parse_range(answers['range'])
+            output_dir = input(f"{CYAN}📁 Папка для сохранения [Manga]: {ENDC}").strip() or 'Manga'
+            range_str = input(f"{CYAN}💡 Укажите диапазон (Enter = все): {ENDC}").strip()
+            start_chapter, end_chapter = ComXLifeDownloader.parse_range(range_str)
 
             downloader.download_manga(manga_url, output_dir, start_chapter, end_chapter)
 
