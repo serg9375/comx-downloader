@@ -387,14 +387,16 @@ class ComXLifeDownloader:
                     pass
             return False
 
-    def download_manga(self, manga_url, output_dir="manga", start_chapter=None, end_chapter=None):
+    def download_manga(self, manga_url, output_dir="manga", start_chapter=None, end_chapter=None,
+                        output_format=None, delete_sources=None, quiet=False):
         if not self.load_cookies():
             if not self.get_cookies_via_selenium():
                 print(f"\n{RED}✗ ОШИБКА: Не удалось авторизоваться{ENDC}")
                 return False
 
-        clear_console()
-        print_menu()
+        if not quiet:
+            clear_console()
+            print_menu()
         news_id = self.get_manga_id_from_url(manga_url)
         if not news_id:
             print(f"\n{RED}✗ Не удалось определить ID манги из URL{ENDC}")
@@ -448,7 +450,10 @@ class ComXLifeDownloader:
         print(f"📁 Сохранено в: {base_manga_folder.absolute()}\n")
 
         if success_count > 0:
-            self.prompt_output_creation(base_manga_folder, manga_title)
+            if output_format is not None:
+                self.process_output(base_manga_folder, manga_title, output_format, delete_sources)
+            else:
+                self.prompt_output_creation(base_manga_folder, manga_title)
 
         return True
 
@@ -746,6 +751,29 @@ class ComXLifeDownloader:
         except KeyboardInterrupt:
             print(f"\n{YELLOW}⚠ Отменено{ENDC}")
 
+    def process_output(self, manga_folder, manga_title, output_format, delete_sources):
+        """Non-interactive output creation for batch mode."""
+        if output_format == "none":
+            return
+        output_path = manga_folder.parent / f"{manga_title}.{output_format}"
+        if output_format == "cbz":
+            success = self.create_cbz(manga_folder, output_path)
+        else:
+            success = self.create_pdf(manga_folder, output_path)
+        if success and delete_sources:
+            self.delete_manga_folder(manga_folder)
+
+def save_batch_file(filepath, urls, settings):
+    """Write/update batch JSON file."""
+    data = {"urls": urls, "settings": settings}
+    with open(filepath, 'w', encoding='utf-8') as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+
+def load_batch_file(filepath):
+    """Read and return batch data from JSON file."""
+    with open(filepath, 'r', encoding='utf-8') as f:
+        return json.load(f)
+
 def main():
     if sys.version_info < (3, 7):
         print(f"{RED}✗ Ошибка: Этот скрипт требует Python 3.7+.{ENDC}")
@@ -772,55 +800,209 @@ def main():
             clear_console()
             print_menu()
 
-            input_str = input(f"{CYAN}📖 Введите URL или Название манги (Enter для выхода): {ENDC}").strip()
+            input_str = input(f"{CYAN}📖 Введите URL, название манги или путь к batch .json (Enter для выхода): {ENDC}").strip()
 
             if not input_str:
                 raise KeyboardInterrupt
-            manga_url = None
 
-            if 'com-x.life' in input_str and 'http' in input_str:
-                manga_url = input_str
-            else:
-                clear_console()
-                print_menu()
-                print(f"\n{YELLOW}🔍 Ищу '{input_str}'...{ENDC}")
-                results = downloader.fetch_search_results_sync(input_str)
-
-                clear_console()
-                print_menu()
-
-                if not results:
-                    print(f"{RED}✗ Ничего не найдено по запросу '{input_str}'.{ENDC}")
-                    time.sleep(2)
-                    continue
-
-                if len(results) == 1:
-                    manga_url = results[0]['url']
-                    print(f"✓ Найдена 1 манга: {results[0]['title']}")
-                else:
-                    print(f"\n{YELLOW}📚 Найдено {len(results)} результатов. Выберите:{ENDC}")
-                    for i, res in enumerate(results, 1):
-                        print(f"  {i:02d}: {res['title']}")
-
-                    print(f"\n{GREY}(Введите номер или нажмите Enter для нового поиска){ENDC}")
-                    choice_str = input(f"{CYAN}Выберите номер: {ENDC}").strip()
-
-                    if not choice_str:
-                        continue
-
-                    try:
-                        choice_idx = int(choice_str) - 1
-                        if 0 <= choice_idx < len(results):
-                            manga_url = results[choice_idx]['url']
-                            print(f"✓ Выбрано: {results[choice_idx]['title']}")
-                        else:
-                            print(f"{RED}✗ Неверный номер.{ENDC}")
-                            time.sleep(2)
-                            continue
-                    except ValueError:
-                        print(f"{RED}✗ Неверный ввод.{ENDC}")
+            # --- Path A: Resume existing batch JSON ---
+            if input_str.endswith('.json') and Path(input_str).is_file():
+                try:
+                    batch_data = load_batch_file(input_str)
+                    batch_urls = batch_data["urls"]
+                    settings = batch_data["settings"]
+                    pending = [u for u in batch_urls if u["status"] != "done"]
+                    if not pending:
+                        print(f"{GREEN}✓ Все URL в этом батче уже обработаны.{ENDC}")
                         time.sleep(2)
                         continue
+                    print(f"\n{YELLOW}📋 Возобновление батча: {len(pending)} из {len(batch_urls)} ожидают скачивания{ENDC}")
+                    output_dir = settings.get("output_dir", "Manga")
+                    range_str = settings.get("chapters", "")
+                    start_chapter, end_chapter = ComXLifeDownloader.parse_range(range_str)
+                    output_format = settings.get("format", "none")
+                    delete_sources = settings.get("delete_sources", False)
+                    batch_filepath = Path(input_str)
+
+                    done_count = 0
+                    fail_count = 0
+                    for entry in batch_urls:
+                        if entry["status"] == "done":
+                            continue
+                        print(f"\n{CYAN}{BOLD}▶ [{done_count + fail_count + 1}/{len(pending)}] {entry['url']}{ENDC}")
+                        try:
+                            ok = downloader.download_manga(
+                                entry["url"], output_dir, start_chapter, end_chapter,
+                                output_format=output_format, delete_sources=delete_sources, quiet=True
+                            )
+                            if ok:
+                                entry["status"] = "done"
+                                done_count += 1
+                            else:
+                                fail_count += 1
+                        except KeyboardInterrupt:
+                            print(f"\n{YELLOW}⚠ Батч прерван пользователем{ENDC}")
+                            save_batch_file(batch_filepath, batch_urls, settings)
+                            break
+                        save_batch_file(batch_filepath, batch_urls, settings)
+
+                    print(SEPARATOR)
+                    print(f"{GREEN}{BOLD}ИТОГИ БАТЧА{ENDC}")
+                    print(SEPARATOR)
+                    print(f"  ✓ Успешно: {done_count}")
+                    if fail_count:
+                        print(f"  ✗ Ошибки: {fail_count}")
+                    remaining = sum(1 for u in batch_urls if u["status"] != "done")
+                    if remaining:
+                        print(f"  ⏳ Осталось: {remaining}")
+                    print(f"  📄 Батч-файл: {batch_filepath}")
+
+                except Exception as e:
+                    print(f"{RED}✗ Ошибка чтения батч-файла: {e}{ENDC}")
+                    time.sleep(2)
+
+                print(f"\n{CYAN}Нажмите Enter, чтобы продолжить...{ENDC}")
+                input()
+                continue
+
+            # --- Path B: URL → build batch list ---
+            if 'com-x.life' in input_str and 'http' in input_str:
+                batch_urls_list = [input_str]
+                print(f"\n{GREEN}  1. {input_str}{ENDC}")
+
+                while True:
+                    next_input = input(f"{CYAN}📖 Добавьте ещё URL или 'y' для начала скачивания: {ENDC}").strip()
+                    if next_input.lower() == 'y':
+                        break
+                    if 'com-x.life' in next_input and 'http' in next_input:
+                        batch_urls_list.append(next_input)
+                        print(f"{GREEN}  {len(batch_urls_list)}. {next_input}{ENDC}")
+                    elif not next_input:
+                        continue
+                    else:
+                        print(f"{YELLOW}⚠ Введите URL com-x.life или 'y' для старта{ENDC}")
+
+                # Collect settings once
+                output_dir = input(f"{CYAN}📁 Папка для сохранения [Manga]: {ENDC}").strip() or 'Manga'
+                range_str = input(f"{CYAN}💡 Укажите диапазон глав (Enter = все): {ENDC}").strip()
+                start_chapter, end_chapter = ComXLifeDownloader.parse_range(range_str)
+
+                fmt_questions = [
+                    inquirer.List('format',
+                                  message="📦 Формат для всех манг",
+                                  choices=[
+                                      ('CBZ (рекомендуется)', 'cbz'),
+                                      ('PDF', 'pdf'),
+                                      ('Не создавать', 'none'),
+                                  ],
+                                  carousel=True),
+                ]
+                fmt_answers = inquirer.prompt(fmt_questions)
+                output_format = fmt_answers['format'] if fmt_answers else 'none'
+
+                delete_sources = False
+                if output_format != 'none':
+                    del_questions = [
+                        inquirer.Confirm('delete_sources',
+                                         message="🗑  Удалить исходные изображения после создания?",
+                                         default=False),
+                    ]
+                    del_answers = inquirer.prompt(del_questions)
+                    delete_sources = del_answers['delete_sources'] if del_answers else False
+
+                # Build batch tracking data
+                batch_entries = [{"url": u, "status": "pending"} for u in batch_urls_list]
+                settings = {
+                    "output_dir": output_dir,
+                    "chapters": range_str,
+                    "format": output_format,
+                    "delete_sources": delete_sources,
+                }
+                timestamp = time.strftime("%Y%m%d_%H%M%S")
+                batch_filepath = Path(output_dir) / f"batch_{timestamp}.json"
+                Path(output_dir).mkdir(parents=True, exist_ok=True)
+                save_batch_file(batch_filepath, batch_entries, settings)
+                print(f"\n{GREY}📄 Батч-файл: {batch_filepath}{ENDC}")
+
+                # Process each URL
+                done_count = 0
+                fail_count = 0
+                for idx, entry in enumerate(batch_entries):
+                    print(f"\n{CYAN}{BOLD}▶ [{idx + 1}/{len(batch_entries)}] {entry['url']}{ENDC}")
+                    try:
+                        ok = downloader.download_manga(
+                            entry["url"], output_dir, start_chapter, end_chapter,
+                            output_format=output_format, delete_sources=delete_sources, quiet=True
+                        )
+                        if ok:
+                            entry["status"] = "done"
+                            done_count += 1
+                        else:
+                            fail_count += 1
+                    except KeyboardInterrupt:
+                        print(f"\n{YELLOW}⚠ Батч прерван пользователем{ENDC}")
+                        save_batch_file(batch_filepath, batch_entries, settings)
+                        break
+                    save_batch_file(batch_filepath, batch_entries, settings)
+
+                # Summary
+                print(SEPARATOR)
+                print(f"{GREEN}{BOLD}ИТОГИ БАТЧА{ENDC}")
+                print(SEPARATOR)
+                print(f"  ✓ Успешно: {done_count}")
+                if fail_count:
+                    print(f"  ✗ Ошибки: {fail_count}")
+                remaining = sum(1 for e in batch_entries if e["status"] != "done")
+                if remaining:
+                    print(f"  ⏳ Осталось: {remaining}")
+                print(f"  📄 Батч-файл: {batch_filepath}")
+
+                print(f"\n{CYAN}Нажмите Enter, чтобы продолжить...{ENDC}")
+                input()
+                continue
+
+            # --- Path D: Search query (unchanged) ---
+            manga_url = None
+            clear_console()
+            print_menu()
+            print(f"\n{YELLOW}🔍 Ищу '{input_str}'...{ENDC}")
+            results = downloader.fetch_search_results_sync(input_str)
+
+            clear_console()
+            print_menu()
+
+            if not results:
+                print(f"{RED}✗ Ничего не найдено по запросу '{input_str}'.{ENDC}")
+                time.sleep(2)
+                continue
+
+            if len(results) == 1:
+                manga_url = results[0]['url']
+                print(f"✓ Найдена 1 манга: {results[0]['title']}")
+            else:
+                print(f"\n{YELLOW}📚 Найдено {len(results)} результатов. Выберите:{ENDC}")
+                for i, res in enumerate(results, 1):
+                    print(f"  {i:02d}: {res['title']}")
+
+                print(f"\n{GREY}(Введите номер или нажмите Enter для нового поиска){ENDC}")
+                choice_str = input(f"{CYAN}Выберите номер: {ENDC}").strip()
+
+                if not choice_str:
+                    continue
+
+                try:
+                    choice_idx = int(choice_str) - 1
+                    if 0 <= choice_idx < len(results):
+                        manga_url = results[choice_idx]['url']
+                        print(f"✓ Выбрано: {results[choice_idx]['title']}")
+                    else:
+                        print(f"{RED}✗ Неверный номер.{ENDC}")
+                        time.sleep(2)
+                        continue
+                except ValueError:
+                    print(f"{RED}✗ Неверный ввод.{ENDC}")
+                    time.sleep(2)
+                    continue
 
             if not manga_url:
                  continue
